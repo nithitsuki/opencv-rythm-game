@@ -1,365 +1,295 @@
 import os
-# Reduce TensorFlow C++ backend log noise.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-# Disable oneDNN path for more consistent behavior across machines.
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-# Suppress absl and other logging
-import logging
-import absl.logging
-# Remove the default absl logging hook so startup output stays clean.
-logging.root.removeHandler(absl.logging._absl_handler)
-# Avoid pre-init warning spam from absl.
-absl.logging._warn_preinit_stderr = False
-
-# OpenCV handles webcam capture and on-screen drawing.
 import cv2
-# MediaPipe provides hand landmark detection/tracking.
-import mediapipe as mp
-# time is used for startup delay and timestamp generation.
+import math
 import time
-# hashlib is used to print model SHA-256 for integrity/provenance checks.
-import hashlib
-# Path is used for robust model path handling.
+import random
+import numpy as np
+import mediapipe as mp
 from pathlib import Path
-# urlretrieve downloads a model if it is missing locally.
-from urllib.request import urlretrieve
-# Import arrow-key scan code constants used by the game.
-from directkeys import right_pressed,left_pressed
-# Import helper functions that synthesize key down/up events on Windows.
-from directkeys import PressKey, ReleaseKey
 
-
-# Map game actions to keyboard scan codes.
-break_key_pressed=left_pressed
-accelerato_key_pressed=right_pressed
-
-# Absolute path to this script's directory.
+# MediaPipe Setup
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-# ------------------------------
-# MODEL CONFIGURATION
-# ------------------------------
-# 1) HAND_LANDMARKER_VARIANT:
-#    - "float16" -> uses official MediaPipe float16 model bundle
-#
-# NOTE: int8 path is temporarily disabled while we stabilize conversion.
-#
-# 2) HAND_LANDMARKER_MODEL_PATH:
-#    Optional custom absolute or relative path to a .task model file.
-#
-# 3) HAND_LANDMARKER_MODEL_URL:
-#    Optional URL used for download when requested model file is not present.
-HAND_LANDMARKER_VARIANT = os.getenv("HAND_LANDMARKER_VARIANT", "float16").strip().lower()
-HAND_LANDMARKER_MODEL_PATH = os.getenv("HAND_LANDMARKER_MODEL_PATH", "").strip()
-HAND_LANDMARKER_MODEL_URL = os.getenv("HAND_LANDMARKER_MODEL_URL", "").strip()
-
-FLOAT16_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
-FLOAT16_MODEL_PATH = PROJECT_ROOT / "models" / "hand_landmarker_float16.task"
-
-# ------------------------------
-# PERFORMANCE SETTINGS
-# ------------------------------
-# INFERENCE_SIZE:
-#   Frame is resized before inference to reduce per-frame compute cost.
-# FRAME_PROCESS_STRIDE:
-#   Process every Nth frame (e.g., 2 means process every second frame).
-# LANDMARK_QUANT_LEVELS:
-#   8-bit quantization grid for landmark coordinates (0..255).
-INFERENCE_SIZE = (320, 240)
-FRAME_PROCESS_STRIDE = 2
-LANDMARK_QUANT_LEVELS = 255  # 8-bit coordinate quantization
-
-# Small startup delay helps users switch to the game window before input starts.
-time.sleep(2.0)
-
-# Runtime state used by the gesture controller loop.
-# Tracks keys currently held down by this script.
-current_key_pressed = set()
-previous_gesture = None  # Track previous gesture to avoid repeated key presses
-frame_skip = 0  # Process every nth frame for better performance
-# Last timestamp passed to VIDEO-mode inference.
-last_timestamp_ms = 0
-
-# Aliases to keep task API access concise and readable in workshop demos.
+MODEL_PATH = PROJECT_ROOT / "models" / "hand_landmarker_float16.task"
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-# Connection pairs used for drawing hand skeleton lines.
-try:
-    HAND_CONNECTIONS = tuple(mp.solutions.hands.HAND_CONNECTIONS)
-except AttributeError:
-    # Fallback for builds where `mediapipe.solutions` is not exposed.
-    HAND_CONNECTIONS = (
-        (0, 1), (1, 2), (2, 3), (3, 4),
-        (0, 5), (5, 6), (6, 7), (7, 8),
-        (5, 9), (9, 10), (10, 11), (11, 12),
-        (9, 13), (13, 14), (14, 15), (15, 16),
-        (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
-    )
-
-# Landmark index map for fingertips: thumb, index, middle, ring, pinky.
-tipIds=[4,8,12,16,20]
-
-
-def resolve_model_path_and_url():
-    """Resolve which model file to load and where it comes from.
-
-    Returns:
-        Tuple[pathlib.Path, str]: (model_path, model_source)
-            - model_source is either:
-              - "custom" (already local file)
-              - an HTTP URL (download required if file missing)
-    """
-    if HAND_LANDMARKER_MODEL_PATH:
-        custom_path = Path(HAND_LANDMARKER_MODEL_PATH)
-        if not custom_path.is_absolute():
-            custom_path = PROJECT_ROOT / custom_path
-        custom_path = custom_path.resolve()
-        if not custom_path.exists():
-            raise FileNotFoundError(f"Configured model path does not exist: {custom_path}")
-        return custom_path, "custom"
-
-    if HAND_LANDMARKER_VARIANT == "int8":
-        print("Int8 is temporarily disabled; falling back to float16 model.")
-
-    if HAND_LANDMARKER_VARIANT in ("float16", "int8"):
-        return FLOAT16_MODEL_PATH, FLOAT16_MODEL_URL
-
-    raise ValueError("HAND_LANDMARKER_VARIANT must be 'float16' for now.")
-
-
-def ensure_model_exists(model_path, model_url):
-    """Ensure the requested model exists locally; download only when allowed."""
-    # Ensure the destination directory exists before file checks/download.
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    # No-op when the model file is already present.
-    if model_path.exists():
-        return
-    # If no downloadable source exists, fail with a clear error.
-    if model_url in ("", "custom"):
-        raise FileNotFoundError(f"Model not found at: {model_path}")
-    # Download official model artifact.
-    print(f"Downloading TFLite task model to {model_path}...")
-    urlretrieve(model_url, model_path)
-
-
-def sha256_file(file_path):
-    """Compute SHA-256 hash for model provenance/integrity checks."""
-    # Incremental hashing avoids loading the full model into memory.
-    digest = hashlib.sha256()
-    # Read bytes from disk because hash functions operate on bytes.
-    with open(file_path, "rb") as model_file:
-        while True:
-            # 1 MiB chunk size balances speed and memory use.
-            chunk = model_file.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    # Return the digest as a hex string.
-    return digest.hexdigest()
-
-
-def print_model_self_check(model_path, variant, model_source):
-    """Print a clear startup report so workshop attendees can verify model identity."""
-    stat_info = model_path.stat()
-    model_hash = sha256_file(model_path)
-    print("\n=== Hand Landmarker Model Self-Check ===")
-    print(f"Variant requested   : {variant}")
-    print(f"Model source       : {model_source}")
-    print(f"Model path         : {model_path}")
-    print(f"Model size (bytes) : {stat_info.st_size}")
-    print(f"Model modified UTC : {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(stat_info.st_mtime))}")
-    print(f"Model SHA-256      : {model_hash}")
-    print("========================================\n")
-
-
-def get_timestamp_ms():
-    """Generate strictly increasing timestamps for VIDEO mode inference calls.
-
-    MediaPipe VIDEO mode expects monotonically increasing frame timestamps.
-    """
-    global last_timestamp_ms
-    ts = int(time.perf_counter() * 1000)
-    if ts <= last_timestamp_ms:
-        ts = last_timestamp_ms + 1
-    last_timestamp_ms = ts
-    return ts
-
-
-def quantize_landmark_coords(landmark):
-    """Map normalized float coordinates into an 8-bit integer grid.
-
-    Example:
-        x = 0.5 -> int(0.5 * 255) = 127
-
-    This keeps gesture logic lightweight and deterministic.
-    """
-    # Clamp values in case the model emits tiny out-of-range numbers.
-    x = min(max(landmark.x,     0.0), 1.0)
-    y = min(max(landmark.y, 0.0), 1.0)
-    return (
-        int(x * LANDMARK_QUANT_LEVELS),
-        int(y * LANDMARK_QUANT_LEVELS),
-    )
-
-
-def draw_hand_landmarks(image, hand_landmarks):
-    """Render landmark points and hand connection lines on the display frame."""
-    # Capture frame dimensions to convert normalized landmarks -> pixel space.
-    h, w, _ = image.shape
-    # Keep pixel points so we can draw skeleton edges by landmark index.
-    points = []
-    for lm in hand_landmarks:
-        # Convert normalized (0..1) coordinate to pixel coordinate.
-        px, py = int(lm.x * w), int(lm.y * h)
-        points.append((px, py))
-        # Draw each landmark as a small filled circle.
-        cv2.circle(image, (px, py), 2, (0, 255, 255), cv2.FILLED)
-
-    # Draw line segments that form the hand skeleton.
-    for start_idx, end_idx in HAND_CONNECTIONS:
-        cv2.line(image, points[start_idx], points[end_idx], (0, 200, 0), 1)
-
-# Open the default system webcam.
-video=cv2.VideoCapture(0)
-
-if not video.isOpened():
-    # Abort early if camera is unavailable.
-    raise RuntimeError("Could not open webcam. Check camera permissions/device availability.")
-
-# Optimize camera settings for better performance
-video.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-video.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-video.set(cv2.CAP_PROP_FPS, 60)
-video.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize lag
-
-MODEL_PATH, MODEL_URL = resolve_model_path_and_url()
-ensure_model_exists(MODEL_PATH, MODEL_URL)
-print_model_self_check(MODEL_PATH, HAND_LANDMARKER_VARIANT, MODEL_URL)
-
-# HandLandmarker task setup:
-# - VIDEO mode enables tracking optimizations between frames.
-# - num_hands=1 keeps latency lower for this game controller scenario.
-options = HandLandmarkerOptions(
-    # Path to selected .task model bundle.
-    base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-    # VIDEO mode uses temporal tracking and requires timestamps.
-    running_mode=VisionRunningMode.VIDEO,
-    # Single-hand setup for low-latency controller behavior.
-    num_hands=1,
-    # Confidence thresholds for detection/presence/tracking.
-    min_hand_detection_confidence=0.7,
-    min_hand_presence_confidence=0.5,
-    min_tracking_confidence=0.5,
+HAND_CONNECTIONS = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20),
 )
 
-try:
-    # Context manager handles native resource lifecycle.
-    with HandLandmarker.create_from_options(options) as hand_landmarker:
+import wave
+import subprocess
+
+# Secure pure-python Audio Synthesizer (No volatile C-extensions)
+sample_rate = 44100
+sound_dir = PROJECT_ROOT / "sounds"
+sound_dir.mkdir(exist_ok=True)
+
+class AsyncWavPlayer:
+    def __init__(self, seq, filename, wave_type='square'):
+        self.filepath = str(sound_dir / filename)
+        
+        # 1) Synthesize Sound Math into Numpy Arrays
+        parts = []
+        for freq, duration, pvol in seq:
+            if freq == 0:
+                parts.append(np.zeros(int(sample_rate * duration)))
+            else:
+                t = np.linspace(0, duration, int(sample_rate * duration), False)
+                if wave_type == 'sine':
+                    wave_data = np.sin(freq * t * 2 * np.pi)
+                else:
+                    wave_data = np.sign(np.sin(freq * t * 2 * np.pi))
+                
+                # Envelope to prevent clicking
+                ramp = int(sample_rate * 0.01)
+                env = np.ones_like(t)
+                if len(env) > ramp * 2:
+                    env[:ramp] = np.linspace(0, 1, ramp)
+                    env[-ramp:] = np.linspace(1, 0, ramp)
+                
+                parts.append(wave_data * env * pvol)
+        
+        # Convert to 16-bit PCM Audio
+        audio = (np.concatenate(parts) * 32767).astype(np.int16)
+        
+        # 2) Save to pure .wav file
+        with wave.open(self.filepath, 'w') as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(sample_rate)
+            f.writeframes(audio.tobytes())
+
+    def play(self):
+        # 3) Safely pass local file to robust Linux audio server subprocess
+        try:
+            # `aplay` natively hooks ALSA. Can swap to `paplay` (PulseAudio) if you want.
+            subprocess.Popen(['aplay', '-q', self.filepath], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+print("Pre-rendering synthesized sounds...")
+sfx_hit = AsyncWavPlayer([(880, 0.05, 0.4), (1760, 0.08, 0.4)], 'hit.wav', 'sine')
+sfx_miss = AsyncWavPlayer([(150, 0.25, 0.5)], 'miss.wav', 'square')
+sfx_levelup = AsyncWavPlayer([(440, 0.1, 0.3), (554, 0.1, 0.3), (659, 0.1, 0.3), (880, 0.4, 0.4)], 'levelup.wav', 'square')
+
+music_freqs = [261.63, 311.13, 349.23, 392.00, 349.23, 311.13]
+music_notes = [AsyncWavPlayer([(f, 0.15, 0.15)], f'note_{i}.wav', 'square') for i, f in enumerate(music_freqs)]
+
+# -------------------- Game Logic --------------------
+
+def distance(p1, p2):
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+def detect_shapes(hand_landmarks_list):
+    for hand_landmarks in hand_landmarks_list:
+        if distance(hand_landmarks[4], hand_landmarks[8]) < 0.04:
+            return "Circle"
+    if len(hand_landmarks_list) == 2:
+        h1, h2 = hand_landmarks_list[0], hand_landmarks_list[1]
+        
+        if distance(h1[4], h2[4]) < 0.05 and distance(h1[8], h2[8]) < 0.05:
+            if distance(h1[4], h1[8]) > 0.08:
+                return "Triangle"
+                
+        if distance(h1[6], h2[6]) < 0.05 and distance(h1[8], h2[8]) > 0.05:
+            return "Cross"
+    return "None"
+
+def draw_landmarks(image, hand_landmarks_list):
+    h, w, _ = image.shape
+    for hand_landmarks in hand_landmarks_list:
+        points = []
+        for lm in hand_landmarks:
+            px, py = int(lm.x * w), int(lm.y * h)
+            points.append((px, py))
+            cv2.circle(image, (px, py), 2, (0, 255, 255), cv2.FILLED)
+        for start_idx, end_idx in HAND_CONNECTIONS:
+            cv2.line(image, points[start_idx], points[end_idx], (0, 200, 0), 1)
+
+def draw_shape_icon(frame, shape_type, x, y, size):
+    thickness = 4
+    if shape_type == "Circle":
+        cv2.circle(frame, (x, y), size, (0, 165, 255), thickness)
+    elif shape_type == "Triangle":
+        pts = np.array([
+            [x, y - size],
+            [x - int(size*0.866), y + int(size*0.5)],
+            [x + int(size*0.866), y + int(size*0.5)]
+        ], np.int32)
+        cv2.polylines(frame, [pts], True, (0, 255, 0), thickness)
+    elif shape_type == "Cross":
+        offset = int(size*0.7)
+        cv2.line(frame, (x - offset, y - offset), (x + offset, y + offset), (0, 0, 255), thickness)
+        cv2.line(frame, (x + offset, y - offset), (x - offset, y + offset), (0, 0, 255), thickness)
+
+def main():
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
+        running_mode=VisionRunningMode.VIDEO,
+        num_hands=2,
+        min_hand_detection_confidence=0.5,
+        min_hand_presence_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+
+    cap = cv2.VideoCapture(0)
+    W, H = 640, 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    
+    # Gameplay Variables
+    notes = [] 
+    speed = 6
+    spawn_timer = 0
+    spawn_interval = 45 
+    score = 0
+    combo = 0
+    
+    # Levels and Timing
+    level = 1
+    level_start = time.time()
+    LEVEL_DURATION = 30 # seconds
+
+    # Strict Hit System
+    previous_detected = "None"
+    shape_formed_time = time.time()
+    ALLOWED_HOLD_DURATION = 1.0 # Max time to hold a shape before it becomes "Early"
+
+    hit_msg = ""
+    hit_timer = 0
+    too_early_timer = 0
+    music_idx = 0
+    
+    ALLOWED_SHAPES = ["Circle", "Triangle", "Cross"]
+    TARGET_Y = H - 100
+    HIT_TOLERANCE = 50
+
+    last_ts = 0
+    print("Welcome to Symbol Rhythm Game!")
+    
+    with HandLandmarker.create_from_options(options) as landmarker:
         while True:
-            # Skip frames for better performance
-            frame_skip += 1
-            # Read one frame from webcam.
-            ret, image = video.read()
-            if not ret:
-                # Frame grab can fail transiently; continue loop.
-                continue
+            current_time = time.time()
+            ret, frame = cap.read()
+            if not ret: break
+            
+            frame = cv2.flip(frame, 1)
+            fH, fW, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            ts = int(time.perf_counter() * 1000)
+            if ts <= last_ts: ts = last_ts + 1
+            last_ts = ts
+            
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect_for_video(mp_img, ts)
+            
+            detected = "None"
+            if result.hand_landmarks:
+                draw_landmarks(frame, result.hand_landmarks)
+                detected = detect_shapes(result.hand_landmarks)
+            
+            # Check edge trigger for shapes
+            if detected != previous_detected:
+                shape_formed_time = current_time
+                previous_detected = detected
 
-            if frame_skip % FRAME_PROCESS_STRIDE == 0:
-                # 1) Preprocess frame for inference: resize and convert BGR -> RGB.
-                resized_frame = cv2.resize(image, INFERENCE_SIZE)
-                rgb_frame = cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB)
+            # Level Progression
+            if current_time - level_start > LEVEL_DURATION:
+                level += 1
+                level_start = current_time
+                speed += 2
+                spawn_interval = max(15, spawn_interval - 5)
+                hit_msg = f"LEVEL {level}!"
+                hit_timer = 45
+                sfx_levelup.play()
 
-                # 2) Wrap numpy frame in MediaPipe Image and run VIDEO-mode inference.
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                results = hand_landmarker.detect_for_video(mp_image, get_timestamp_ms())
+            # Draw target hit zone
+            cv2.line(frame, (0, TARGET_Y), (fW, TARGET_Y), (255, 255, 255), 2)
+            
+            # Spawn notes & play beat
+            spawn_timer += 1
+            if spawn_timer >= spawn_interval:
+                spawn_timer = 0
+                shape = random.choice(ALLOWED_SHAPES)
+                x_pos = random.randint(100, fW - 100)
+                notes.append({'type': shape, 'x': x_pos, 'y': -50, 'hit': False, 'scored': False})
+                
+                # Play Synth background music note matched to spawn beat
+                music_notes[music_idx].play()
+                music_idx = (music_idx + 1) % len(music_notes)
 
-                # 3) Build compact landmark list for gesture logic.
-                lmList = []
-                if results.hand_landmarks:
-                    # We only use the first detected hand because num_hands=1.
-                    hand_landmarks = results.hand_landmarks[0]
-                    # Draw landmarks on display frame for visual feedback.
-                    draw_hand_landmarks(image, hand_landmarks)
+            # Update and Draw notes
+            for note in notes[:]:
+                note['y'] += speed
+                if note['hit']: continue
+                
+                draw_shape_icon(frame, note['type'], note['x'], note['y'], 30)
 
-                    # Quantize normalized landmarks into an 8-bit grid.
-                    for id, lm in enumerate(hand_landmarks):
-                        qx, qy = quantize_landmark_coords(lm)
-                        lmList.append([id, qx, qy])
-
-                # 4) Convert landmarks to finger-open/finger-closed states.
-                fingers = []
-                if len(lmList) != 0:
-                    # Thumb rule uses x-axis relationship for this camera orientation.
-                    if lmList[tipIds[0]][1] > lmList[tipIds[0] - 1][1]:
-                        fingers.append(1)
-                    else:
-                        fingers.append(0)
-
-                    # Remaining fingers use y-axis tip-vs-joint relationship.
-                    for id in range(1, 5):
-                        if lmList[tipIds[id]][2] < lmList[tipIds[id] - 2][2]:
-                            fingers.append(1)
+                # Check Hit
+                if abs(note['y'] - TARGET_Y) <= HIT_TOLERANCE:
+                    if detected == note['type']:
+                        time_held = current_time - shape_formed_time
+                        if time_held < ALLOWED_HOLD_DURATION:
+                            # VALID HIT
+                            note['hit'] = True
+                            note['scored'] = True
+                            score += (10 * (1 + combo))
+                            combo += 1
+                            hit_msg = "PERFECT!"
+                            hit_timer = 15
+                            sfx_hit.play()
                         else:
-                            fingers.append(0)
-                    total = fingers.count(1)
+                            # POORLY TIMED (Held too long before arriving)
+                            too_early_timer = 5
+                            cv2.putText(frame, "HELD TOO LONG!", (fW // 2 - 200, TARGET_Y - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+                
+                # Check Miss
+                if note['y'] - TARGET_Y > HIT_TOLERANCE and not note['hit']:
+                    note['hit'] = True
+                    combo = 0
+                    hit_msg = "MISS!"
+                    hit_timer = 15
+                    sfx_miss.play()
 
-                    # 5) Map finger-count to game gesture.
-                    current_gesture = "NONE"
-                    # Closed fist -> brake.
-                    if total == 0:
-                        current_gesture = "BRAKE"
-                    # Open palm -> accelerate.
-                    elif total == 5:
-                        current_gesture = "GAS"
+            # Remove off-screen notes
+            notes = [n for n in notes if n['y'] < fH + 100 or (n.get('scored') and n['y'] > TARGET_Y + HIT_TOLERANCE + 20)]
 
-                    # Only update keys if gesture has changed
-                    if current_gesture != previous_gesture:
-                        if current_gesture == "BRAKE":
-                            # Release any key currently held before pressing brake.
-                            for key in current_key_pressed:
-                                ReleaseKey(key)
-                            current_key_pressed.clear()
-                            # Hold brake key while this gesture is active.
-                            PressKey(break_key_pressed)
-                            current_key_pressed.add(break_key_pressed)
-                        elif current_gesture == "GAS":
-                            # Release any key currently held before pressing gas.
-                            for key in current_key_pressed:
-                                ReleaseKey(key)
-                            current_key_pressed.clear()
-                            # Hold gas key while this gesture is active.
-                            PressKey(accelerato_key_pressed)
-                            current_key_pressed.add(accelerato_key_pressed)
-                        else:  # "NONE"
-                            # Neutral gesture: release everything.
-                            for key in current_key_pressed:
-                                ReleaseKey(key)
-                            current_key_pressed.clear()
-                        # Save state so unchanged gestures do not retrigger key events.
-                        previous_gesture = current_gesture
+            # Draw UI
+            cv2.putText(frame, f"Score: {score}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+            cv2.putText(frame, f"Combo: {combo}x", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+            cv2.putText(frame, f"Level: {level}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 255), 2)
+            cv2.putText(frame, f"Detecting: {detected}", (fW - 350, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (200, 200, 200), 2)
 
-            # Update gesture display outside the processing loop to prevent flickering
-            if previous_gesture == "BRAKE":
-                cv2.rectangle(image, (20, 300), (270, 425), (0, 0, 255), cv2.FILLED)  # Red box for brake
-                cv2.putText(image, "BRAKE", (45, 375), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 5)
-            elif previous_gesture == "GAS":
-                cv2.rectangle(image, (20, 300), (270, 425), (0, 255, 0), cv2.FILLED)
-                cv2.putText(image, " GAS", (45, 375), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 0, 0), 5)
+            time_held = current_time - shape_formed_time
+            if detected != "None":
+                color = (0, 255, 0) if time_held < ALLOWED_HOLD_DURATION else (0, 0, 255)
+                cv2.putText(frame, f"Hold Time: {time_held:.1f}s", (fW - 350, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            # Show the annotated frame in an OpenCV window.
-            cv2.imshow("Frame", image)
-            # Exit loop when q is pressed.
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-finally:
-    # Release any remaining pressed keys before closing.
-    for key in current_key_pressed:
-        ReleaseKey(key)
+            if hit_timer > 0:
+                if "LEVEL" in hit_msg:
+                    color = (255, 0, 255)
+                else:
+                    color = (0, 255, 0) if hit_msg == "PERFECT!" else (0, 0, 255)
+                cv2.putText(frame, hit_msg, (fW // 2 - 120, fH // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 4)
+                hit_timer -= 1
 
-    video.release()
+            cv2.imshow("Hand Shape Rhythm Game", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+    cap.release()
     cv2.destroyAllWindows()
 
+if __name__ == "__main__":
+    main()
