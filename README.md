@@ -1,60 +1,37 @@
-# Hill Climb Gesture-Based Control
+# Hand Shape Rhythm Game (OpenCV + MediaPipe)
 
-Simple OpenCV-based Hill Climb Racing game control using MediaPipe Hand Landmarker.
+A rhythm game played using hand gestures! Detects shapes like Circle, Triangle, and Cross using MediaPipe hand landmarks, scoring based on timing as falling notes drop down the screen.
+
+### Attribution and Event Submission
+
+This repository was originally forked from [Chirayu Chaudhari's repo](https://github.com/Champion2049/Hill_Climb_GestureBased) (see `git log` for details). It was used as a base for the submission for the event **Edge-Core: Bridging the Gap Between AI Models and Hardware** conducted by IEEE CIS on Wednesday, 15th April 2026.
+
+## Gameplay Features
+
+- **Gesture Detection:** Form shapes with your hands (Circle, Triangle, Cross) to hit falling notes.
+- **Rhythm Mechanics:** Notes drop down the screen; hit them exactly when they cross the target line!
+- **Dynamic Progression:** The game speeds up and notes spawn faster as you progress through levels.
+- **Synthesized Audio:** Pure Python audio synthesizer (`numpy` + `wave`) played via Linux `aplay`.
+
+## Setup & Run
+
+Install the required dependencies:
+
+```bash
+pip install mediapipe opencv-python numpy
+```
+
+Start the game:
+
+```bash
+python main.py
+```
 
 ## Quantized TFLite Pipeline
 
-This project now uses the MediaPipe Tasks `HandLandmarker` pipeline backed by a
-TFLite model bundle (`hand_landmarker.task`).
+This project uses the MediaPipe Tasks `HandLandmarker` pipeline backed by a TFLite model bundle (`models/hand_landmarker_float16.task`). 
 
-- Default mode: float16.
-- Int8 path is temporarily disabled in code while conversion is stabilized.
+Press `q` to quit the game window.
 
-### Model Selection
 
-Use environment variables:
-
-- `HAND_LANDMARKER_VARIANT=float16` (default: `float16`)
-- `HAND_LANDMARKER_MODEL_PATH=...` to use any local `.task` model file
-- `HAND_LANDMARKER_MODEL_URL=...` optional download URL when model file is missing
-
-Notes:
-
-- Public MediaPipe hand landmarker bundle is currently available as float16.
-- Int8 references are intentionally disabled for now.
-
-## Run
-
-Install dependencies:
-
-```bash
-pip install mediapipe opencv-python
-```
-
-Start the controller:
-
-```bash
-python main.py
-```
-
-Run (auto-download float16 from MediaPipe):
-
-```bash
-set HAND_LANDMARKER_VARIANT=float16
-python main.py
-```
-
-## Startup Self-Check Output
-
-At startup, the app prints model verification details, including:
-
-- requested variant
-- model source
-- resolved model path
-- model size
-- model last-modified timestamp (UTC)
-- SHA-256 hash
-
-This helps confirm that the project is actually running the expected model.
-
-Press `q` to quit.
+P.S: There isn't really music or rythm just yet, so please imagine up cool music playing in the background! thx

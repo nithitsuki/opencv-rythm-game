@@ -117,6 +117,7 @@ def draw_landmarks(image, hand_landmarks_list):
             cv2.line(image, points[start_idx], points[end_idx], (0, 200, 0), 1)
 
 def draw_shape_icon(frame, shape_type, x, y, size):
+    x, y = int(x), int(y)
     thickness = 4
     if shape_type == "Circle":
         cv2.circle(frame, (x, y), size, (0, 165, 255), thickness)
@@ -157,7 +158,7 @@ def main():
     combo = 0
     
     # Levels and Timing
-    level = 3
+    level = 1
     level_start = time.time()
     LEVEL_DURATION = 22 # seconds
 
@@ -209,7 +210,7 @@ def main():
             if current_time - level_start > LEVEL_DURATION:
                 level += 1
                 level_start = current_time
-                speed += 1.25                             
+                speed += 2                          
                 spawn_interval = max(15, spawn_interval - 5)
                 hit_msg = f"LEVEL {level}!"
                 hit_timer = 45
