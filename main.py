@@ -150,16 +150,16 @@ def main():
     
     # Gameplay Variables
     notes = [] 
-    speed = 6
+    speed = 10
     spawn_timer = 0
-    spawn_interval = 45 
+    spawn_interval = 35 
     score = 0
     combo = 0
     
     # Levels and Timing
-    level = 1
+    level = 3
     level_start = time.time()
-    LEVEL_DURATION = 30 # seconds
+    LEVEL_DURATION = 22 # seconds
 
     # Strict Hit System
     previous_detected = "None"
@@ -209,7 +209,7 @@ def main():
             if current_time - level_start > LEVEL_DURATION:
                 level += 1
                 level_start = current_time
-                speed += 2
+                speed += 1.25                             
                 spawn_interval = max(15, spawn_interval - 5)
                 hit_msg = f"LEVEL {level}!"
                 hit_timer = 45
